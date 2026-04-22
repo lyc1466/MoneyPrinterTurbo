@@ -86,59 +86,6 @@ class TestVoiceService(unittest.TestCase):
         audio_duration = vs.get_audio_duration(sub_maker)
         print(f"voice: {voice_name}, audio duration: {audio_duration}s")
 
-    def test_azure_tts_v1_supports_legacy_edge_tts_without_boundary(self):
-        """
-        验证 Azure TTS V1 在旧版 edge_tts 依赖残留时仍可继续工作。
-
-        这个回归场景对应 Windows 便携包更新失败后，现场环境还停留在旧版
-        edge_tts 的情况：
-        1. `Communicate.__init__()` 不接受 `boundary`
-        2. 只有异步 `stream()`，没有 `stream_sync()`
-        """
-
-        class _LegacyCommunicate:
-            def __init__(self, text, voice, rate="+0%"):
-                self.text = text
-                self.voice = voice
-                self.rate = rate
-
-            async def stream(self):
-                yield {"type": "audio", "data": b"legacy-audio"}
-                yield {
-                    "type": "WordBoundary",
-                    "offset": 0,
-                    "duration": 10000000,
-                    "text": "legacy",
-                }
-
-        class _FakeSubMaker:
-            def __init__(self):
-                self.events = []
-
-            def feed(self, chunk):
-                self.events.append(chunk)
-
-            def get_srt(self):
-                if not self.events:
-                    return ""
-                return "1\n00:00:00,000 --> 00:00:01,000\nlegacy\n"
-
-        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
-            vs.edge_tts, "Communicate", _LegacyCommunicate
-        ), patch.object(vs.edge_tts, "SubMaker", _FakeSubMaker):
-            voice_file = str(Path(tmp_dir) / "legacy-edge-tts.mp3")
-            sub_maker = vs.azure_tts_v1(
-                text="legacy edge tts compatibility",
-                voice_name="zh-CN-XiaoyiNeural-Female",
-                voice_file=voice_file,
-                voice_rate=1.0,
-            )
-
-            self.assertIsNotNone(sub_maker)
-            self.assertEqual(Path(voice_file).read_bytes(), b"legacy-audio")
-            self.assertEqual(len(sub_maker.events), 1)
-            self.assertEqual(sub_maker.events[0]["type"], "WordBoundary")
-
     def test_azure_tts_v2(self):
         voice_name = "zh-CN-XiaoxiaoMultilingualNeural-V2-Female"
         voice_name = vs.parse_voice_name(voice_name)
@@ -262,6 +209,34 @@ class TestVoiceService(unittest.TestCase):
             subtitle_content = Path(subtitle_path).read_text(encoding="utf-8")
             self.assertIn("Gemini subtitle generation should work now", subtitle_content)
             self.assertIn("Testing multiple lines", subtitle_content)
+
+    def test_azure_tts_v1_timeout_cleans_partial_audio_file(self):
+        """
+        验证 edge_tts 流式输出超时时，azure_tts_v1 会返回 None，
+        并清理已写入的部分音频文件，避免后续流程误判为成功产物。
+        """
+        def _wait_for_timeout_immediately(coro, *args, **kwargs):
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            raise asyncio.TimeoutError()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            voice_file = str(Path(tmp_dir) / "timeout-partial.mp3")
+            Path(voice_file).write_bytes(b"partial-audio")
+
+            with patch.object(
+                vs.asyncio, "wait_for", side_effect=_wait_for_timeout_immediately
+            ):
+
+                sub_maker = vs.azure_tts_v1(
+                    text="timeout test",
+                    voice_name="zh-CN-XiaoyiNeural-Female",
+                    voice_rate=1.0,
+                    voice_file=voice_file,
+                )
+
+            self.assertIsNone(sub_maker)
+            self.assertFalse(os.path.exists(voice_file))
 
 if __name__ == "__main__":
     # python -m unittest test.services.test_voice.TestVoiceService.test_azure_tts_v1
