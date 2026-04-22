@@ -1,5 +1,4 @@
 import asyncio
-import inspect
 import math
 import os
 import re
@@ -1282,101 +1281,100 @@ def populate_legacy_submaker_with_full_text(
     return sub_maker
 
 
-def create_edge_tts_communicate(
-    text: str, voice_name: str, rate_str: str
-) -> edge_tts.Communicate:
-    """
-    按当前已安装的 edge_tts 版本构造 Communicate 对象。
-
-    背景：
-    1. 主线代码已经升级到 edge_tts 7.x，并使用 `boundary` 参数拿到更细的边界事件；
-    2. 但 Windows 便携包如果更新失败，现场环境可能仍然停留在旧版 edge_tts；
-    3. 旧版 `Communicate.__init__()` 不接受 `boundary`，会直接抛出
-       `unexpected keyword argument 'boundary'`，导致整个 TTS 链路失败。
-
-    因此这里先根据构造函数签名探测当前版本支持的参数，再决定是否传入
-    `boundary`，让同一份代码同时兼容旧版和新版依赖。
-    """
-    communicate_kwargs = {"rate": rate_str}
-    communicate_signature = inspect.signature(edge_tts.Communicate)
-
-    if "boundary" in communicate_signature.parameters:
-        communicate_kwargs["boundary"] = "WordBoundary"
-
-    return edge_tts.Communicate(text, voice_name, **communicate_kwargs)
-
-
-def stream_edge_tts_chunks(communicate, on_chunk) -> None:
-    """
-    统一消费 edge_tts 的同步流和旧版异步流。
-
-    edge_tts 7.x 提供 `stream_sync()`，可以在同步函数里直接迭代；
-    更早的版本通常只有异步 `stream()`。为了让 `azure_tts_v1()` 在
-    旧依赖残留场景下仍能继续工作，这里统一做一层流式兼容。
-
-    Args:
-        communicate: edge_tts.Communicate 实例
-        on_chunk: 每拿到一个事件块时执行的回调
-    """
-    if hasattr(communicate, "stream_sync"):
-        for chunk in communicate.stream_sync():
-            on_chunk(chunk)
-        return
-
-    if not hasattr(communicate, "stream"):
-        raise AttributeError("edge_tts communicate object has no stream method")
-
-    async def _consume_async_stream():
-        async for chunk in communicate.stream():
-            on_chunk(chunk)
-
-    # 这里显式创建独立事件循环，而不是复用外部上下文，目的是避免
-    # 在同步调用栈里遇到“当前线程没有事件循环”或跨线程复用循环的问题。
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(_consume_async_stream())
-    finally:
-        loop.close()
-
-
 def azure_tts_v1(
     text: str, voice_name: str, voice_rate: float, voice_file: str
 ) -> Union[SubMaker, None]:
     voice_name = parse_voice_name(voice_name)
     text = text.strip()
     rate_str = convert_rate_to_percent(voice_rate)
+
+    def _safe_int(value, default):
+        try:
+            ivalue = int(value)
+            return ivalue if ivalue > 0 else default
+        except Exception:
+            return default
+
+    connect_timeout = _safe_int(config.app.get("tts_connect_timeout", 10), 10)
+    receive_timeout = _safe_int(config.app.get("tts_receive_timeout", 30), 30)
+    minimum_total_timeout = connect_timeout + receive_timeout
+    total_timeout = _safe_int(
+        config.app.get("tts_total_timeout", minimum_total_timeout),
+        minimum_total_timeout,
+    )
+    if total_timeout < minimum_total_timeout:
+        total_timeout = minimum_total_timeout
+    proxy_url = config.proxy.get("https") or config.proxy.get("http") or None
+
+    def _cleanup_partial_audio() -> None:
+        if os.path.exists(voice_file):
+            try:
+                os.remove(voice_file)
+            except OSError as e:
+                logger.warning(
+                    f"failed to remove partial audio file: {voice_file}, error: {e}"
+                )
+
+    async def _synthesize_once() -> SubMaker:
+        communicate = edge_tts.Communicate(
+            text,
+            voice_name,
+            rate=rate_str,
+            boundary="WordBoundary",
+            proxy=proxy_url,
+            connect_timeout=connect_timeout,
+            receive_timeout=receive_timeout,
+        )
+        sub_maker = edge_tts.SubMaker()
+
+        with open(voice_file, "wb") as file:
+            async for chunk in communicate.stream():
+                chunk_type = chunk["type"]
+                if chunk_type == "audio":
+                    file.write(chunk["data"])
+                elif chunk_type in ["WordBoundary", "SentenceBoundary"]:
+                    sub_maker.feed(chunk)
+
+        return sub_maker
+
     for i in range(3):
         try:
             logger.info(f"start, voice name: {voice_name}, try: {i + 1}")
+            if i == 0:
+                logger.info(
+                    f"edge tts network settings: connect_timeout={connect_timeout}s, receive_timeout={receive_timeout}s, total_timeout={total_timeout}s, proxy={'enabled' if proxy_url else 'disabled'}"
+                )
 
-            # 这里同时兼容 edge_tts 7.x 和旧版便携包里可能残留的老依赖：
-            # 1. 新版支持 `boundary` + `stream_sync()`
-            # 2. 旧版不支持 `boundary`，且通常只暴露异步 `stream()`
+            # 为避免偶发网络阻塞导致长时间无响应，使用全局硬超时包裹整个 TTS 流程。
             ensure_file_path_exists(voice_file)
-            communicate = create_edge_tts_communicate(text, voice_name, rate_str)
-            sub_maker = edge_tts.SubMaker()
-
-            with open(voice_file, "wb") as file:
-                def _handle_chunk(chunk):
-                    chunk_type = chunk["type"]
-                    if chunk_type == "audio":
-                        file.write(chunk["data"])
-                    elif chunk_type in ["WordBoundary", "SentenceBoundary"]:
-                        # 无论来自 7.x 的同步流，还是旧版异步流，只要事件结构
-                        # 里仍有边界信息，就统一喂给 SubMaker，保证后续字幕链路
-                        # 仍然走项目现有逻辑。
-                        sub_maker.feed(chunk)
-
-                stream_edge_tts_chunks(communicate, _handle_chunk)
+            sub_maker = asyncio.run(
+                asyncio.wait_for(_synthesize_once(), timeout=total_timeout)
+            )
 
             if not sub_maker.get_srt():
                 logger.warning("failed, sub_maker.get_srt() is empty")
+                _cleanup_partial_audio()
                 continue
 
             logger.info(f"completed, output file: {voice_file}")
             return sub_maker
+        except asyncio.TimeoutError:
+            _cleanup_partial_audio()
+            logger.error(
+                f"failed, error: total timeout exceeded ({total_timeout}s)"
+            )
         except Exception as e:
-            logger.error(f"failed, error: {str(e)}")
+            _cleanup_partial_audio()
+            err_msg = str(e)
+            if "No audio was received" in err_msg:
+                logger.error(
+                    "failed, error: No audio was received. This is usually caused by a voice/text language mismatch (for example, Chinese script with a non-Chinese voice)."
+                )
+            else:
+                logger.error(f"failed, error: {err_msg}")
+    logger.error(
+        "edge tts failed after retries. Check network/proxy settings in config.toml ([proxy], [app].tts_connect_timeout, [app].tts_receive_timeout, [app].tts_total_timeout)."
+    )
     return None
 
 

@@ -125,6 +125,15 @@ modelscope_model_name = "Qwen/Qwen3-32B"
 # If empty, the subtitle will not be generated
 subtitle_provider = "edge"
 
+# Edge TTS network timeout settings (seconds)
+# If your network is unstable or blocked, lower receive timeout to fail fast.
+# Keep tts_total_timeout >= tts_connect_timeout + tts_receive_timeout
+# so the hard timeout will not fire earlier than the configured receive timeout.
+tts_connect_timeout = 10
+tts_receive_timeout = 30
+# Hard timeout for the whole TTS request. Once exceeded, the attempt is aborted.
+tts_total_timeout = 40
+
 #
 # ImageMagick
 #

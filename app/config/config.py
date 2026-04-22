@@ -1,6 +1,7 @@
 import os
 import shutil
 import socket
+import glob
 
 import toml
 from loguru import logger
@@ -77,7 +78,27 @@ if imagemagick_path and os.path.isfile(imagemagick_path):
     os.environ["IMAGEMAGICK_BINARY"] = imagemagick_path
 
 ffmpeg_path = app.get("ffmpeg_path", "")
+existing_ffmpeg_env = os.getenv("IMAGEIO_FFMPEG_EXE", "")
+existing_ffmpeg_env_is_valid = bool(
+    existing_ffmpeg_env and os.path.isfile(existing_ffmpeg_env)
+)
 if ffmpeg_path and os.path.isfile(ffmpeg_path):
     os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
+elif os.name == "nt" and not existing_ffmpeg_env_is_valid:
+    # 兼容便携版目录结构：优先自动探测上级 lib/ffmpeg 下的 ffmpeg.exe。
+    candidate_patterns = [
+        os.path.abspath(os.path.join(root_dir, "..", "lib", "ffmpeg", "**", "ffmpeg.exe")),
+        os.path.abspath(os.path.join(root_dir, "lib", "ffmpeg", "**", "ffmpeg.exe")),
+    ]
+    detected_ffmpeg = ""
+    for pattern in candidate_patterns:
+        matched = sorted(glob.glob(pattern, recursive=True))
+        if matched:
+            detected_ffmpeg = matched[0]
+            break
+
+    if detected_ffmpeg and os.path.isfile(detected_ffmpeg):
+        os.environ["IMAGEIO_FFMPEG_EXE"] = detected_ffmpeg
+        logger.info(f"auto detected ffmpeg: {detected_ffmpeg}")
 
 logger.info(f"{project_name} v{project_version}")
